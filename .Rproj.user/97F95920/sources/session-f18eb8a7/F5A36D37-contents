@@ -1,0 +1,182 @@
+## GLOBAL ATTRIBUTES FOR Auckland LAKE MODELLING SHINY APP
+Sys.setenv(TZ = "UTC")
+
+library(vtable)
+library(plotly)
+library(plyr)
+library(tidyverse)
+library(magrittr)
+library(spdplyr)
+library(leaflet)
+library(shiny)
+library(shinydashboard)
+library(rgl)
+library(sf)
+library(RColorBrewer)
+library(rgdal)
+library(fields)
+library(fontawesome)
+library(gplots)
+library(lubridate)
+library(cowplot)
+library(rLakeAnalyzer)
+
+
+# load functions --------
+lapply(paste0('fun/', list.files(path = 'fun/', recursive = F,
+                                 all.files = T, pattern = "[.]R$")), source)
+
+
+# #------------- gis resources ------------
+# 
+# # read in the gis files (leaflet projection)
+# file.names <- list.files('data/', pattern = '_leaflet.rds')
+# # read for leaflet
+# for(i in 1:length(file.names)) { 
+#   
+#   assign(gsub('_leaflet.rds','', file.names[i]), 
+#          readRDS(paste0('data/', file.names[i])) )
+#   
+# }
+
+#------------ metadata -----------------
+lawa <- readRDS("data/lawa_alldata.rds") %>%
+  filter(SiteType == "Lake" & Region == "Auckland") %>%
+  mutate(Value = ifelse(Variable == "TN" & Units == "mg/m3",
+                        as.numeric(Value)/1000, as.numeric(Value)),
+         Units = ifelse(Variable == "TN" & Units == "mg/m3", "mg/L", Units),
+         var.parent = paste(recode(Variable,
+                                   "TP"    = "Phosphorus",
+                                   "NH4-N" = "Nitrogen",
+                                   "TN"    = "Nitrogen",
+                                   "Secchi"= "Secchi",
+                                   "Chl-a" = "Chlorophyll",
+                                   "pH"    = "pH",
+                                   "Cyano (total)" = "Cyanobacteria",
+                                   "Cyano (pot.tox.)" = "Cyanobacteria"), 
+                            "(",Units,")")
+  )
+
+wq <- read_csv("data/AClakes_obs_clean.csv")
+wq$Lake[wq$Lake == "Pehiakura Small"] <- "Pehiakurasmall"
+wq$Lake[wq$Lake == "Pehiakura Big"] <- "Pehiakurabig"
+wq <- wq %>% 
+  dplyr::rename(lake = Lake) %>% 
+  mutate(DateTime = as_datetime(DateTime, format = "%d/%m/%Y %H:%M"),
+         Depth = factor(Depth))
+
+
+#------------ metadata -----------------
+meta2 <- read_csv("data/lakes_meta.csv")
+
+wq <- left_join(wq, meta2[, c("lake", "LID")], by = "lake")
+
+meta2_sf <- sf::st_as_sf(meta2, coords = c("lon", "lat"), crs = 4326)
+
+
+meta <- readRDS('data/lakes_meta.rds') %>%
+  st_transform(4326) %>%
+  filter(region == "Auckland" & LID %in% meta2$LID) %>% 
+  mutate(Name_comp = ifelse(is.na(Name_primary), Name_fenz, Name_primary)) %>%
+  mutate(Name_comp = ifelse(is.na(Name_comp), paste0("z.LID ", LID), Name_comp),
+         lon = st_coordinates(.) %>% data.frame() %>% pull(1),
+         lat = st_coordinates(.) %>% data.frame() %>% pull(2), 
+         lawa = ifelse(LID %in% lawa$SiteID,"Yes","")) %>% 
+  left_join(meta2[, -c(2, 3)], by = "LID")
+
+# st_bbox(shores[1, ])
+# 
+# ggplot() +
+#   geom_sf(data = meta[1, ]) +
+#   geom_sf(data = shores[1, ])
+
+
+# lake shorelines
+shores <- readRDS("data/lakes_shorelines_verified.rds") %>%
+  st_transform(4326) %>%
+  merge(., meta %>% st_drop_geometry() %>% select(c("LID","Name_comp")), by = "LID") %>%
+  mutate(id = LID)
+
+
+# era5 data
+era5_lookup_table <- read.csv("data/era5_lookup_table.csv")
+era5 <- readRDS("data/era5.rds")
+vcsn <- readRDS("data/vcsn.rds")
+met_data <- list(ERA5 = era5, VCSN = vcsn)
+# met_vars <- colnames(era5[[1]])[-1]
+# met_vars <- era5_lookup_table$variable[("Snowfall_millimeterPerDay" != era5_lookup_table$ler_name)]
+
+# Hypsograph data ----
+hyps <- readRDS("data/hyps.rds")
+
+# LER data
+lan_ref <- data.frame(var = c("BuoyCr", "MetaLim", "Tcline", "InEngy", "SchStb" ),
+                      names = c("Center of buoyancy", "Metalimnion", "Thermocline", "Internal energy", "Schmidt stability"),
+                      units = c("m", "m", "m", "J", "J/m^2"))
+ler <- readRDS("data/ler_era5.rds")
+ler_models <- c("GLM", "GOTM", "Simstrat") #names(ler[[1]][[1]])
+
+# wbal <- readRDS("data/glm_lake_level_era5.rds")
+
+# base leaflet map ---------------
+
+leaf.base <- leaflet() 
+
+
+# plotting ---------
+
+# colour palette
+water.vec <- c("#000000","#000413",
+               "#000728","#002650",
+               "#005E8C","#007AAA","#22A9C2",
+               "#45BCBB","#67CFB5","#8AE2AE","#ACF6A8",
+               "#BCF8B9","#CBF9CA","#DBFBDC","#EBFDED")
+cb.cols <- RColorBrewer::brewer.pal(6, "Dark2")
+
+
+# theme
+theme_lt <- function(base_size) {
+  theme_bw(base_size = base_size) +
+    theme(# text=element_text(family="serif"),
+      plot.title = element_text(size = 14), #, color = 'dark grey'),
+      plot.subtitle = element_text(size = 12, color = 'grey'),
+      panel.background = element_rect(fill = "white"),
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      # panel.border = element_blank(), 
+      axis.line.x = element_blank(), 
+      axis.line.y = element_blank(),
+      legend.margin=margin(0,0,0,0),
+      legend.box.margin=margin(-15,-5,0,0))
+}
+
+noVarPlot <- function(title.nv) {
+  ggplot(data.frame()) +
+    theme_lt(16)+
+    labs(subtitle = title.nv) +
+    theme(plot.subtitle = element_text(size = 12, color = 'pink'))
+}
+
+
+# maps ------
+
+# baselayer options
+lyrs.base <- c("Esri.WorldGrayCanvas",
+               "OpenStreetMap.Mapnik",
+               "Esri.WorldImagery") %>%
+  `names<-`(c("Silhouette", "Street","Satellite"))
+
+
+# leaflet buoy markers
+buoyIcon <- makeIcon(
+  iconUrl = "www/buoy4.png",
+  iconWidth = 50*0.8, iconHeight = 70*0.8,
+  iconAnchorX = 17, iconAnchorY = 60
+)
+
+
+# Limnotrack colours 
+cols <- c("#f39414", "#f6c479", "#0464ac", "#035695")
+hmap.cols <- rev(RColorBrewer::brewer.pal(11, "Spectral"))
+
+

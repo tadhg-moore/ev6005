@@ -1,0 +1,18 @@
+dat <- tibble::tibble(
+  Precinct = c(1, 1, 1, 2),
+  Crime = c("Murder", "Rape", "Burglary", "Murder"),
+  `2000` = c(3, 12, 252, 4),
+  `2001` = c(1, 5, 188, 2),
+  `2002` = c(2, 10, 297, 1),
+  `2003` = c(2, 11, 403, 0)
+)
+
+tidyr::gather(dat, Year, Value, 3:6)
+tidyr::gather(dat, Year, Value, -Precinct, -Crime)
+
+
+set.seed(596)
+dsamp <- diamonds[sample(nrow(diamonds), 1000), ]
+(d <- ggplot(dsamp, aes(carat, price)) +
+    geom_point(aes(colour = clarity)))
+d + scale_colour_brewer()

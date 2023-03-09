@@ -1,0 +1,14 @@
+name: EV6005-Assignment-2
+title: EV6005-Assignment-2
+username:
+account: tadhgm
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 7622080
+bundleId: 6553689
+url: https://tadhgm.shinyapps.io/EV6005-Assignment-2/
+when: 1669373687.77077
+lastSyncTime: 1669373687.77078
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: data/EV6005_assignment2.csv

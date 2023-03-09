@@ -1,0 +1,780 @@
+# Define server logic ----
+
+server <- function(input, output, session) {
+  
+  # set reactive variables for loading and trimming data ------
+  ls <- reactiveValues(meta = meta,
+                       # shores = shores,
+                       # default map frame
+                       map.frame = c(176, -41.3, 6),
+                       name = NULL,
+                       rec = NULL,
+                       catch = NULL,
+                       bathy = NULL,
+                       lawa = NULL,
+                       wq = NULL)
+  
+  # filter the metadata and shore polygons by region, resources and size -----
+  toListen <- reactive({
+    list(#input$region,
+         input$filt, input$size)
+  })
+  
+  observeEvent(
+    toListen(),
+    {
+      if(input$filt == "Verified lakes") {
+        ls$meta <- meta %>% filter(verified == "Yes")
+      } else if(input$filt == "Bathymetry available") {
+        ls$meta <- meta %>%  filter(bathy == "Yes" & region == "Auckland")
+      } else if (input$filt == "Water quality data available") {
+        ls$meta <- meta %>%  filter(lawa == "Yes")
+      } else {ls$meta <- meta}
+      
+      # filter by region if selected
+      # if(input$region != "All") { ls$meta %<>% filter(region == input$region) }
+      
+      ls$meta %<>%
+        filter(area_ha > input$size)
+    })
+  
+  # render the lake selector drop-down
+  output$select_lk <- renderUI({
+    
+    # load and filter by size
+    meta.nms <- ls$meta %>%
+      replace(is.na(.), "") %>%
+      st_drop_geometry() %>%
+      arrange(Name_comp)
+    
+    #-- which name format to display
+    if(input$names == "Common") {
+      col.nm = "Name_comp"
+    } else if(input$names == "Maaori") {
+      col.nm = "Name_Maaori"
+    } else {
+      col.nm = "Name_English"
+    }
+    
+    these.names = c(0, meta.nms$LID) %>%
+      `names<-`(c("Click here..", meta.nms[, col.nm]))
+    
+    selectizeInput("lake", "Select a lake", options= list(maxOptions = 5000),
+                   choices = these.names, selected = NULL) 
+  })
+  
+  
+  # site selection, update on map click ----
+  observe({
+    click <- input$map.main_shape_click
+    
+    if(is.null(click)) return()
+    updateSelectInput(session, "lake", selected = click$id )
+  })
+  
+  observe({
+    click <- input$map.main_marker_click
+
+    if(is.null(click)) return()
+    updateSelectInput(session, "lake", selected = click$id )
+  })
+  
+  
+  # update the leaflet frame and inputs based on the lake selection ----
+  observeEvent(
+    input$lake,
+    {
+      if(input$lake != 0) {
+        ls$map.frame <- c(meta %>% filter(LID == input$lake) %>% pull(lon),
+                          meta %>% filter(LID == input$lake) %>% pull(lat),
+                          14)
+      } else {
+        ls$map.frame <- c(174.7, -36.8, 9)
+      }
+      
+      # load in the rec and catchment information
+      if(input$lake != 0) {
+        ls$name  <- meta %>% filter(LID == input$lake) %>% pull(Name_comp)
+        ls$rec   <- NULL # rec[[input$lake]][["REC"]]
+        ls$catch <- NULL # rec[[input$lake]][["Catchment"]]
+        ls$bathy <- NULL #bathy[[input$lake]]
+        ls$lawa  <- lawa %>% filter(SiteID == input$lake) 
+        ls$wq <- wq %>% filter(LID == input$lake) 
+      }
+    })
+
+  
+    
+  ## mapping ---------
+  
+  # main map ---------
+  output$map.main <- leaflet::renderLeaflet({ leaf.base })
+  
+  # update map frame via proxy
+  observe({
+    leaf.shores <- shores %>%  filter(LID %in% ls$meta$LID)
+    
+    proxy <- leafletProxy("map.main") %>%
+      setView(lng = ls$map.frame[1], lat = ls$map.frame[2], zoom = ls$map.frame[3]) %>%
+      clearGroup("shores") %>%
+      addMarkers(data = meta2_sf, label = ~name_final, layerId = ~LID, clusterOptions = markerClusterOptions()) %>%
+      addPolygons(data = leaf.shores, group = "shores",
+                  color = 'blue',  fill = T, fillOpacity = 0.5, weight = 1,
+                  label = ~Name_comp,
+                  layerId = ~LID)
+  })
+  
+  # add spatial features via proxy
+  observe({  
+    
+    proxy <- leafletProxy("map.main") %>% 
+      clearGroup("prov") %>%
+      addProviderTiles(input$base, group = "prov") 
+    
+    if(!is.null(ls$catch[["Final"]])) {
+      
+      proxy %>% 
+        clearGroup("catch") %>%
+        addPolygons(data = ls$catch[["Final"]] %>% st_transform(4326), group = "catch",
+                    color = 'green',  fill = F, weight = 4,
+                    label = paste0("Catchment for LID ", input$lake, ", ", ls$name)
+        )
+    }
+    
+    if(!is.null(ls$rec[["Reaches"]])) {
+      
+      rec.rch <- ls$rec[["Reaches"]] %>%
+        mutate(reachtype = ifelse(reachtype == "3", "terminal", reachtype),
+               cols.rch = recode(pull(.,input$rec.type),
+                                 "inflow" = "yellow",
+                                 "in&outflow" = "orange",
+                                 "mid-lake" = "black",
+                                 "outflow" = "red",
+                                 "tributary" = "grey",
+                                 "not assigned" = "white",
+                                 "terminal" = "green") )
+      
+      proxy %>% 
+        clearGroup("reaches") %>% 
+        removeControl(layerId = "reaches") %>%
+        addPolylines(data = rec.rch %>% st_transform(4326), group = "reaches",
+                     color = rec.rch$cols.rch ,  weight = 2, opacity = 0.8,
+                     label = ~paste0("HydroID ", rec.rch$HydroID)) %>%
+        leaflet::addLegend(layerId = "reaches",
+                           colors = gplots::col2hex(unique(rec.rch$cols.rch)),
+                           labels = unique(pull(rec.rch, input$rec.type) ) )
+    }
+  })
+  
+  # add lawa site markers
+  # observe({  
+  #   proxy <- leafletProxy("map.main") %>%
+  #     clearGroup("lawa") %>%
+  #     removeControl(layerId = "lawa")
+  #   
+  #   if(!is.null(input$lawa)) {
+  #     these.locs <- locs.lawa %>%
+  #       filter(SiteType %in% input$lawa,
+  #              dist_to_lake < input$proximity * 1000) 
+  #     
+  #     pal <- colorFactor(palette = 'Dark2', domain = these.locs$SiteType)
+  #     
+  #     proxy %>%
+  #       clearGroup("lawa") %>%
+  #       removeControl(layerId = "lawa") %>%
+  #       addCircles(data = these.locs, group = "lawa",
+  #                  color = ~pal(SiteType), label = these.locs$SiteName,
+  #                  radius = 100, opacity = 1, fill = T) %>%
+  #       leaflet::addLegend(layerId = "lawa",
+  #                          colors = unique(pal(these.locs$SiteType)),
+  #                          labels = unique(these.locs$SiteType) )
+  #   }
+  # })
+  
+  # add buoy markers
+  observeEvent(input$buoys,{  
+    proxy <- leafletProxy("map.main") %>%
+      clearGroup("buoys")
+    
+    if(isTRUE(input$buoys)) {
+      proxy %>%
+        addMarkers(data = locs.buoys, group = "buoys",
+                   lng=~lng, lat=~lat, icon = buoyIcon,
+                   popup = ~labels)#,
+    } 
+  })
+  
+
+  ## bathymetry tab ----------
+  
+  # bathy map --------
+  output$map.bathy <- leaflet::renderLeaflet({
+    
+    map <- leaf.base %>%
+      addProviderTiles(providers$Esri.WorldImagery) %>% 
+      setView(lng = ls$map.frame[1], lat = ls$map.frame[2], zoom = ls$map.frame[3]+2) %>%
+      addPolygons(data = shores %>%  filter(LID ==input$lake),
+                  color = 'red',  fill = F, weight = 2) 
+    
+    if(input$lake == 0) { map
+      
+    } else if(is.null(ls$bathy$ras)) {
+      
+      map %>%
+        addLabelOnlyMarkers(lng = ls$map.frame[1], lat = ls$map.frame[2],
+                            label = "No bathymetry available", 
+                            labelOptions = labelOptions(noHide = T,
+                                                        style = list("color" = "red", "font-family" = "serif",
+                                                                     "font-style" = "italic", 
+                                                                     "box-shadow" = "3px 3px rgba(0,0,0,0.25)",
+                                                                     "font-size" = "15px",
+                                                                     "border-color" = "rgba(0,0,0,0.5)")) ) 
+    } else {
+      
+      ras <- ls$bathy[["ras"]] %>%
+        raster::projectRaster(., crs = 4326) %>%
+        raster::aggregate(., 2)
+      
+      # raster palette
+      water.pal = colorNumeric(rev(water.vec), raster::values(ras),
+                               na.color = "transparent")
+      
+      map %>%
+        addRasterImage(ras, colors = rev(water.vec), opacity = 1) %>%
+        leaflet::addLegend(pal = water.pal, values = raster::values(ras), title = "Depth (m)" ) %>%
+        addCircles(data = sf::st_coordinates(ls$bathy[["pts"]]),
+                   color = "white", radius = 0.0005,
+                   label = "Survey points") 
+    }
+  })
+  
+  
+  # hypsography ------
+  output$hypso <- renderPlotly({
+    
+    if(is.null(hyps[[input$lake]])) { 
+      noVarPlot("No hypsography available at this site") 
+      } else {
+        
+        p <- ggplot(hyps[[input$lake]]) +
+          geom_line(aes(Area_meterSquared, Depth_meter), colour = 'blue', size = 1) +
+          geom_point(aes(Area_meterSquared, Depth_meter), colour = 'blue', size = 3) +
+          labs(x = "Planar area (m^2)", y = "Depth (m)") +
+          scale_y_reverse() +
+          theme_lt(18) +
+          ggtitle(paste0("Hypsographic curve for ", meta2$name_final[meta2$LID == input$lake], " (LID ", input$lake, ") "))
+        ggplotly(p, dynamicTicks = TRUE)
+      }
+  })
+  
+  output$interact <- rgl::renderRglwidget({
+
+    if(!is.null(ls$bathy)) {
+      bathy_rgl(ls$bathy$ras)
+    }
+  })
+  
+  # Select Met var  ----
+  output$sel_met_var <- renderUI({
+    
+    validate(
+      need(input$lake %in% names(met_data[[input$met_data]]), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need(!is.null(met_data[[input$met_data]][[input$lake]]), paste0("No ", input$met_data, " available for this lake."))
+    )
+    met_vars <- era5_lookup_table$variable[era5_lookup_table$ler_name %in% names(met_data[[input$met_data]][[input$lake]])[-1]]
+    met_vars <- met_vars[!(met_vars %in% c("Wind u-vector at 10m", "Wind v-vector at 10m", "Snowfall"))]
+    
+    selectInput("met_var", "Select variable to plot", met_vars)
+  })
+  
+  # Met timeseries plot ----
+  output$era5_ts_plot <- renderPlotly({
+    
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need(!is.null(met_data[[input$met_data]][[input$lake]]), paste0("No ", input$met_data, " available for this lake."))
+    )
+    validate(
+      need(!is.null(input$met_var), "Please select a meteorological variable.")
+    )
+    
+    met_var <- era5_lookup_table$ler_name[era5_lookup_table$variable == input$met_var]
+    ylab <- paste0(input$met_var, " (", era5_lookup_table$plot_units[era5_lookup_table$variable == input$met_var], ")")
+    
+    p <- met_data[[input$met_data]][[input$lake]] %>% 
+      ggplot() +
+      geom_line(aes(.data[["datetime"]], .data[[met_var]])) +
+      ylab(ylab) +
+      xlab("Date") +
+      theme_lt(16)
+    return(ggplotly(p))
+  })
+  
+  # Met tile plot ----
+  output$era5_tile_plot <- renderPlot({
+    
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    era5_var <- era5_lookup_table$ler_name[era5_lookup_table$variable == input$met_var]
+    ylab <- paste0(input$met_var, " (", era5_lookup_table$plot_units[era5_lookup_table$variable == input$met_var], ")")
+    
+    if(input$met_var %in% c("Wind u-vector at 10m", "Wind v-vector at 10m", "Total precipitation", "Total rainfall", "Snowfall","Wind speed at 10m")) {
+      pcols <- c("#ffffff", cols[3])
+    } else {
+      pcols <- hmap.cols
+    }
+    df <- met_data[[input$met_data]][[input$lake]]
+    
+    names(df)[names(df) == era5_var] <- "Value"
+    df <- df %>% 
+      mutate(Year = year(datetime), Date = strftime(datetime , format = "%m-%d")) %>% 
+      filter(Year >= 2002)
+    
+    p <-  ggplot(df) +
+      geom_tile(aes_string("Date", "Year", fill = "Value")) +
+      scale_fill_gradientn(colours = pcols, na.value = "grey") +
+      labs(fill = input$met_var) +
+      scale_y_reverse(breaks = seq(1999, 2021, 3)) +
+      scale_x_discrete(breaks = paste0(str_pad(1:12, 2, pad = "0"), "-01"), labels = month.abb) +
+      ylab(ylab) +
+      xlab("Day of year") +
+      theme_lt(16)
+    # gp <- ggplotly(p)
+    return(p)
+  })
+  
+  # ERA5 histogram plot ----
+  output$era5_hist_plot <- renderPlotly({
+    
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    era5_var <- era5_lookup_table$ler_name[era5_lookup_table$variable == input$met_var]
+    xlab <- paste0(input$met_var, " (", era5_lookup_table$plot_units[era5_lookup_table$variable == input$met_var], ")")
+    
+    df <- data.frame(stat = c("Mean", "Median"), value = c(mean(era5[[input$lake]][[era5_var]], na.rm = TRUE), median(era5[[input$lake]][[era5_var]], na.rm = TRUE)))
+    
+    p <- era5[[input$lake]] %>% 
+      ggplot() +
+      geom_histogram(aes_string(era5_var), bins = 50, fill = cols[2]) +
+      geom_vline(data = df, aes(xintercept = value, colour = stat)) +
+      xlab(xlab) +
+      theme_lt(16)
+    return(ggplotly(p))
+  })
+  
+  # Met summary statistics
+  output$met_dt <- DT::renderDT({
+    
+    era5 <- met_data[["ERA5"]][[input$lake]] 
+    era5$Precipitation_millimeterPerDay <- era5$Precipitation_millimeterPerDay / 100
+    vcsn <- met_data[["VCSN"]][[input$lake]]
+    # validate(
+    #   need(!is.null(era5), "No ERA5 data for this lake.")
+    # )
+    
+    era5 <- vtable::st(era5, out = "return", 
+                       summ = c('notNA(x)','mean(x)','median(x)', 'sd(x)','min(x)','pctile(x)[25]','pctile(x)[75]','max(x)'), 
+                       summ.names = c('N','Mean','Median','Std. Dev.','Min','Pctl. 25','Pctl. 75','Max'))
+    era5$Data <- "ERA5"
+    era5$Units <- NA
+    
+    for(i in 1:nrow(era5)) {
+      era5$Units[i] <- era5_lookup_table$plot_units[(era5_lookup_table$ler_name == era5$Variable[i])]
+      era5$Variable[i] <- era5_lookup_table$variable[(era5_lookup_table$ler_name == era5$Variable[i])]
+    }    
+    vcsn <- vtable::st(vcsn, out = "return", 
+                       summ = c('notNA(x)','mean(x)','median(x)', 'sd(x)','min(x)','pctile(x)[25]','pctile(x)[75]','max(x)'), 
+                       summ.names = c('N','Mean','Median','Std. Dev.','Min','Pctl. 25','Pctl. 75','Max'))
+    vcsn$Data <- "VCSN"
+    vcsn$Units <- NA
+
+    for(i in 1:nrow(vcsn)) {
+      vcsn$Units[i] <- era5_lookup_table$plot_units[(era5_lookup_table$ler_name == vcsn$Variable[i])]
+      vcsn$Variable[i] <- era5_lookup_table$variable[(era5_lookup_table$ler_name == vcsn$Variable[i])]
+    }
+    
+    
+    df <- rbind(era5, vcsn) %>% 
+      dplyr::arrange(-desc(Variable)) %>% 
+      filter(!(Variable %in% c("Snowfall", "Wind u-vector at 10m", "Wind v-vector at 10m"))) %>% 
+      relocate(Variable, Data, Units)
+    df
+    DT::datatable(df, selection = "none", class = "cell-border stripe",
+                  options = list(searching = FALSE, paging = FALSE, ordering = FALSE, dom = "t"), rownames = FALSE)
+    
+  })
+  
+  # LER output ----
+  output$ler_heatmap <- renderPlot({
+    
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need(length(input$ler_mod) > 0 | input$add_obs_ler_heatmap, "Select a lake model or observations.")
+    )
+    validate(
+      need(!is.null(ler[[input$lake]]), "No model simulations for this lake.")
+    )
+    if(input$add_obs_ler_heatmap) {
+      mods <- c("Obs", input$ler_mod)
+    } else {
+      mods <- input$ler_mod
+    }
+    
+    p <- plot_heatmap_tile(var_list = ler[[input$lake]][["temp"]][mods]) + 
+      facet_wrap(~Model, ncol = 1) +
+      ylab("Depth (m)") +
+      xlab("Date") +
+      labs(fill = "Temp. (degC)") + 
+      scale_x_datetime(date_breaks = "6 months", date_labels = "%m/%Y") +
+      theme_lt(14)
+    return(p)
+  })
+  
+  # LER Depth output ----
+  output$sel_depths <- renderUI({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    selectInput("depth_sel", "Select depths:",
+                get.offsets(ler[[input$lake]][["temp"]][[1]]), multiple = TRUE)
+  })
+  output$obs_depths <- renderText({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    obs <- ler[[input$lake]][["temp"]][["Obs"]]
+    validate(
+      need(!is.null(obs), "No observations for this lake.")
+    )
+    # obs <- ler[[18]][["temp"]][["Obs"]]
+    obs <- obs[ , colSums(is.na(obs)) < nrow(obs)] 
+    if(length(dim(obs)) < 2) {
+      return("No observational data available.")
+    } else {
+      obs_deps <- rLakeAnalyzer::get.offsets(obs)
+      return(paste(obs_deps, collapse = ", "))
+    }
+  })
+  
+  ler_plot <- reactiveValues(depth = NULL)
+  observeEvent(input$gen_depth_plot, {
+      req(input$lake %in% names(era5))
+      req(length(input$depth_sel) > 0)
+      req(input$gen_depth_plot > 0)
+
+    p <- plot_ensemble(var_list = ler[[input$lake]][["temp"]][c("Obs", ler_models)], depth = input$depth_sel) +
+      ylab("Temperature (degC)") +
+      xlab("Date") +
+      # guides(colour = guide_legend(override.aes = list(size = 3))) +
+      scale_x_datetime(date_breaks = "1 year") +
+      scale_colour_manual(values = c("GLM" = cb.cols[1], "GOTM" = cb.cols[2],
+                                     "Simstrat" = cb.cols[3], "mean" = "#000000", "Obs" = "#000000")) +
+      theme_lt(12)
+    ler_plot$depth <- p
+  })
+  
+  observeEvent(input$depth_sel, {
+    ler_plot$depth <- NULL
+  })
+  
+  output$ler_depth <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need(length(input$depth_sel) > 0, "Select a depth to plot.")
+    )
+    validate(
+      need(!is.null(ler_plot$depth), "Click 'Create plot'.")
+      )
+    
+    ggplotly(ler_plot$depth)
+    
+  })
+  
+  # LER LakeAnalyzer output ----
+  output$ler_lan_plot <- renderPlot({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need(length(input$ler_mod) > 0 | input$add_obs_ler_heatmap, "Select a lake model or observations observations.")
+    )
+    validate(
+      need(length(input$lake_an) > 0, "Select a LakeAnalyzer output to visualize.")
+    )
+    validate(
+      need(!is.null(ler[[input$lake]]), "No model simulations for this lake.")
+    )
+    if(input$add_obs_ler_heatmap) {
+      mods <- c("Obs", input$ler_mod)
+    } else {
+      mods <- input$ler_mod
+    }
+    lan_vars <- lan_ref$var[lan_ref$names %in% input$lake_an]
+    
+    plist <- list()
+    
+    for(v in lan_vars) {
+      if(v == "MetaLim") {
+        plist[[length(plist) + 1]] <- plot_meta(lake_list = ler[[input$lake]],
+                                              model = mods) +
+          theme_lt(12)
+      } else {
+        plist[[length(plist) + 1]] <- plot_ler_lan(lake_list = ler[[input$lake]],
+                                                 model = mods, type = v, lan_ref = lan_ref) +
+          theme_lt(12) + 
+          guides(linetype = guide_legend(override.aes = list(size = 4)))
+      }
+    }
+    
+    g <- ggpubr::ggarrange(plotlist = plist, ncol = 1, common.legend = F)
+    return(g)
+    
+  })
+  
+  # Lake level output ----
+  output$ts_lake_level <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need("mod_lev" %in% names(wbal[[input$lake]]) | "obs_lev" %in% names(wbal[[input$lake]]), 
+           "No water level for this lake.")
+    )
+    p <- ggplot() +
+      {if("mod_lev" %in% names(wbal[[input$lake]])) geom_line(data = wbal[[input$lake]], aes(datetime, mod_lev, colour = "Modelled"))}+
+      {if("obs_lev" %in% names(wbal[[input$lake]])) geom_point(data = wbal[[input$lake]], aes(datetime, obs_lev, colour = "Observed"))}+
+      ylab("Depth (m)") +
+      xlab("Date") +
+      theme_lt(12)
+    ggplotly(p)
+  })
+  
+  output$hist_lake_level <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need("mod_lev" %in% names(wbal[[input$lake]]) | "obs_lev" %in% names(wbal[[input$lake]]), 
+           "No water level for this lake.")
+    )
+    p <- ggplot() +
+      {if("mod_lev" %in% names(wbal[[input$lake]])) geom_histogram(data = wbal[[input$lake]], aes(mod_lev, bins = 50, fill = "Modelled"))}+
+      # {if("obs_lev" %in% names(wbal[[input$lake]])) geom_point(data = wbal[[input$lake]], aes(datetime, obs_lev, colour = "Observed"))}+
+      scale_fill_manual(values = c("Modelled" = cols[2])) +
+      ylab("Frequency") +
+      xlab("Depth (m)") +
+      theme_lt(12)
+    ggplotly(p)
+  })
+  
+  output$tile_lake_level <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need("mod_lev" %in% names(wbal[[input$lake]]) | "obs_lev" %in% names(wbal[[input$lake]]), 
+           "No water level for this lake.")
+    )
+    
+    p <- wbal[[input$lake]] %>% 
+      mutate(Year = year(datetime), Date = strftime(datetime,format="%m-%d")) %>% 
+      ggplot() +
+      geom_tile(aes_string("Date", "Year", fill = "mod_lev")) +
+      scale_fill_gradientn(colours = hmap.cols, na.value = "grey") +
+      labs(fill = "Depth (m)") +
+      scale_y_reverse(breaks = 2012:2021) +
+      scale_x_discrete(breaks = paste0(str_pad(1:12, 2, pad = "0"), "-01"), labels = month.abb) +
+      ylab("Year") +
+      xlab("Day of year") +
+      theme_lt(12)
+    ggplotly(p)
+  })
+
+  # Modelled lake flows ----
+  output$ts_flows <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need("inf" %in% names(wbal[[input$lake]]) | "outf" %in% names(wbal[[input$lake]]),
+           "No modelled flows for this lake.")
+    )
+    if("inf" %in% names(wbal[[input$lake]]) & "outf" %in% names(wbal[[input$lake]])) {
+      wbal[[input$lake]]$net <- wbal[[input$lake]]$inf - wbal[[input$lake]]$outf
+    }
+    
+    p <- ggplot() +
+      {if("inf" %in% names(wbal[[input$lake]])) geom_line(data = wbal[[input$lake]], aes(datetime, inf, colour = "Inflow"))}+
+      {if("outf" %in% names(wbal[[input$lake]])) geom_line(data = wbal[[input$lake]], aes(datetime, outf, colour = "Outflow"))}+
+      {if("net" %in% names(wbal[[input$lake]])) geom_line(data = wbal[[input$lake]], aes(datetime, net, colour = "Net"))}+
+      ylab("Flow (m3/s)") +
+      xlab("Date") +
+      theme_lt(12)
+    ggplotly(p)
+  })
+  
+  output$hist_flows <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need("inf" %in% names(wbal[[input$lake]]) | "outf" %in% names(wbal[[input$lake]]),
+           "No modelled flows for this lake.")
+    )
+    p <- ggplot() +
+      {if("inf" %in% names(wbal[[input$lake]])) geom_histogram(data = wbal[[input$lake]], aes(inf, bins = 50, fill = "Inflows"))}+
+      scale_fill_manual(values = c("Inflows" = cols[3])) +
+      ylab("Frequency") +
+      xlab("Discharge (m^3/s)") +
+      theme_lt(12)
+    ggplotly(p)
+  })
+  
+  output$tile_flows <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need("inf" %in% names(wbal[[input$lake]]) | "outf" %in% names(wbal[[input$lake]]),
+           "No modelled flows for this lake.")
+    )
+    
+    p <- wbal[[input$lake]] %>% 
+      mutate(Year = year(datetime), Date = strftime(datetime, format = "%m-%d")) %>% 
+      ggplot() +
+      geom_tile(aes_string("Date", "Year", fill = "inf")) +
+      scale_fill_gradientn(colours = c("#ffffff", cols[3]), na.value = "grey") +
+      labs(fill = "Discharge (m^3/s)") +
+      scale_y_reverse(breaks = 2012:2021) +
+      scale_x_discrete(breaks = paste0(str_pad(1:12, 2, pad = "0"), "-01"), labels = month.abb) +
+      ylab("Year") +
+      xlab("Day of year") +
+      theme_lt(12)
+    ggplotly(p)
+  })
+
+  # Modelled lake fluxes ----
+  output$ts_fluxes <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need("pre" %in% names(wbal[[input$lake]]) | "evap" %in% names(wbal[[input$lake]]),
+           "No precipitation or evaporation for this lake.")
+    )
+    if("pre" %in% names(wbal[[input$lake]]) & "evap" %in% names(wbal[[input$lake]])) {
+      wbal[[input$lake]]$netf <- wbal[[input$lake]]$pre - wbal[[input$lake]]$evap
+    }
+    
+    p <- ggplot() +
+      {if("pre" %in% names(wbal[[input$lake]])) geom_line(data = wbal[[input$lake]], aes(datetime, pre, colour = "Precip"))}+
+      {if("evap" %in% names(wbal[[input$lake]])) geom_line(data = wbal[[input$lake]], aes(datetime, evap, colour = "Evap"))}+
+      {if("netf" %in% names(wbal[[input$lake]])) geom_line(data = wbal[[input$lake]], aes(datetime, netf, colour = "Net"))}+
+      ylab("Flux (mm/day)") +
+      xlab("Date") +
+      theme_lt(12)
+    ggplotly(p)
+  })
+  
+  output$hist_fluxes <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need("pre" %in% names(wbal[[input$lake]]) | "evap" %in% names(wbal[[input$lake]]),
+           "No precipitation or evaporation for this lake.")
+    )
+    p <- ggplot() +
+      {if("evap" %in% names(wbal[[input$lake]])) geom_histogram(data = wbal[[input$lake]], aes(evap, bins = 50, fill = "Evap"))}+
+      scale_fill_manual(values = c("Evap" = cols[1])) +
+      ylab("Frequency") +
+      xlab("Evaporation (mm/day)") +
+      theme_lt(12)
+    ggplotly(p)
+  })
+  
+  output$tile_fluxes <- renderPlotly({
+    validate(
+      need(input$lake %in% names(era5), "Please select a lake in the Auckland region.")
+    )
+    validate(
+      need("pre" %in% names(wbal[[input$lake]]) | "evap" %in% names(wbal[[input$lake]]),
+           "No precipitation or evaporation for this lake.")
+    )
+    
+    p <- wbal[[input$lake]] %>% 
+      mutate(year = year(datetime), yday = strftime(datetime, format = "%m-%d")) %>% 
+      ggplot() +
+      geom_tile(aes_string("yday", "year", fill = "evap")) +
+      scale_fill_gradientn(colours = c("#ffffff", cols[1]), na.value = "grey") +
+      labs(fill = "Evap (mm/day)") +
+      scale_y_reverse(breaks = 2012:2021) +
+      scale_x_discrete(breaks = paste0(str_pad(1:12, 2, pad = "0"), "-01"), labels = month.abb) +
+      ylab("Year") +
+      xlab("Day of year") +
+      theme_lt(12)
+    ggplotly(p)
+  })
+  
+  # WQ tab: display LAWA data on the water quality tab ---------
+  output$lawa <- renderPlot({
+    validate(
+      need(!is.null(ls$lawa) & nrow(ls$lawa) > 0, "No LAWA available for this lake")
+    )
+    
+    p <- ggplot(ls$lawa %>% filter(SiteType == "Lake")) +
+      geom_point(aes(DateTime, Value, colour = Variable), size = 2) +
+      facet_wrap(~var.parent, ncol = 1, scales = "free_y") +
+      lims(y = c(0,NA)) +
+      labs(title = "Data retrieved from www.lawa.org.nz", x = NULL) +
+      theme_lt(12)
+    return(p)
+    # ggplotly(p)
+  })
+  
+  output$wq <- renderPlotly({
+    validate(
+      need(!is.null(ls$wq) & nrow(ls$wq) > 0, "No water quality data available for this lake")
+    )
+    
+    p <- ggplot(ls$wq) +
+      geom_point(aes(DateTime, Value, colour = Depth), size = 1) +
+      facet_wrap(~Variable, scales = "free_y") +
+      lims(y = c(0,NA)) +
+      # labs(title = "Data retrieved from www.lawa.org.nz", x = NULL) +
+      theme_lt(12)
+    ggplotly(p, dynamicTicks = TRUE)
+    
+  })
+  
+  output$wq_dt <- DT::renderDT({
+    
+    validate(
+      need(!is.null(ls$wq) & nrow(ls$wq) > 0, "No water quality data available for this lake")
+    )
+    
+    df <- ls$wq %>% 
+      select(Variable, Value) %>% 
+      group_by(Variable) %>% 
+      summarise(N = n(), Mean = round(mean(Value), 2), Median = median(Value), "Std. Dev." = round(sd(Value), 2),
+                Min = min(Value), `Pctl. 25` = pctile(Value)[25], "Pctl. 75" = pctile(Value)[75],
+                Max = max(Value))
+    df
+    DT::datatable(df, selection = "none", class = "cell-border stripe",
+                  options = list(searching = FALSE, paging = FALSE, ordering = FALSE, dom = "t"), rownames = FALSE)
+  })
+  
+  
+}
+
+
